@@ -26,7 +26,7 @@ API_HASH = os.getenv("API_HASH")
 
 # Export sozlamalari
 DOWNLOAD_MEDIA = True
-MAX_FILE_SIZE_MB = 100  # Maksimal yuklab olish uchun fayl hajmi (MB)
+MAX_FILE_SIZE_MB = 3000  # Maksimal yuklab olish uchun fayl hajmi (MB)
 
 
 @dataclass
