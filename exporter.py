@@ -11,11 +11,13 @@ from datetime import datetime
 from typing import Any, Optional
 from dataclasses import dataclass, asdict
 import humanize
+import re
 
 from pyrogram import Client
 from pyrogram.types import Message
 from pyrogram.enums import MessageMediaType
 from dotenv import load_dotenv
+from backblaze import upload_to_b2
 
 load_dotenv()
 
@@ -82,18 +84,34 @@ class TelegramExporter:
         self.stats = ExportStats()
         self.messages: list[dict] = []
         self.chat_info: dict = {}
+        self.checkpoint_file: Optional[Path] = None
+        self.checkpoint_data: dict = {}
+        self.chat_folder_name: str = ""
 
     def _setup_output_dir(self):
         """Chiqish papkasini yaratadi"""
         if not self.output_dir:
-            safe_name = str(self.chat_id).replace("@", "").replace("/", "_")
+            # Chat nomi allaqachon o'rnatilgan bo'lishi kerak (export metodida)
+            if not self.chat_folder_name:
+                # Fallback: agar chat_folder_name o'rnatilmagan bo'lsa
+                chat_name = self.chat_info.get("title") or self.chat_info.get("username") or str(self.chat_id)
+                safe_name = re.sub(r'[^\w\s-]', '', chat_name).strip()
+                safe_name = re.sub(r'[-\s]+', '_', safe_name)
+                if not safe_name:
+                    safe_name = f"chat_{self.chat_id}"
+                self.chat_folder_name = safe_name
+            
             self.output_dir = Path(
-                f"exports/{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"exports/{self.chat_folder_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Media papkalarini yaratish
+        # Checkpoint faylini yaratish
+        self.checkpoint_file = self.output_dir / "checkpoint.json"
+        self._load_checkpoint()
+
+        # Media papkalarini yaratish (vaqtinchalik saqlash uchun)
         media_folders = [
             "photos",
             "videos",
@@ -107,12 +125,82 @@ class TelegramExporter:
         for folder in media_folders:
             (self.output_dir / folder).mkdir(exist_ok=True)
 
+    def _get_media_unique_id(self, message: Message, media_type: str) -> Optional[str]:
+        """Media uchun unique ID ni olish (checkpoint uchun)"""
+        try:
+            if media_type == "photo" and message.photo:
+                return message.photo.file_unique_id
+            elif media_type == "video" and message.video:
+                return message.video.file_unique_id
+            elif media_type == "audio" and message.audio:
+                return message.audio.file_unique_id
+            elif media_type == "document" and message.document:
+                return message.document.file_unique_id
+            elif media_type == "voice" and message.voice:
+                return message.voice.file_unique_id
+            elif media_type == "video_note" and message.video_note:
+                return message.video_note.file_unique_id
+            elif media_type == "sticker" and message.sticker:
+                return message.sticker.file_unique_id
+            elif media_type == "animation" and message.animation:
+                return message.animation.file_unique_id
+        except:
+            pass
+        # Fallback: message ID + media type
+        return f"{message.id}_{media_type}"
+
+    def _is_media_processed(self, unique_id: str) -> bool:
+        """Media allaqachon yuklab olingan va yuklanganligini tekshirish"""
+        return unique_id in self.checkpoint_data.get("processed_media", set())
+
+    def _mark_media_processed(self, unique_id: str, s3_url: str):
+        """Media ni qayta ishlangan deb belgilash"""
+        if "processed_media" not in self.checkpoint_data:
+            self.checkpoint_data["processed_media"] = {}
+        self.checkpoint_data["processed_media"][unique_id] = s3_url
+        self._save_checkpoint()
+
+    def _load_checkpoint(self):
+        """Checkpoint faylini yuklash"""
+        if self.checkpoint_file and self.checkpoint_file.exists():
+            try:
+                with open(self.checkpoint_file, "r", encoding="utf-8") as f:
+                    self.checkpoint_data = json.load(f)
+                processed_count = len(self.checkpoint_data.get("processed_media", {}))
+                print(f"   📋 Checkpoint yuklandi: {processed_count} ta media allaqachon qayta ishlangan")
+            except Exception as e:
+                print(f"   ⚠️ Checkpoint yuklashda xato: {e}")
+                self.checkpoint_data = {}
+        else:
+            self.checkpoint_data = {
+                "last_message_id": None,
+                "processed_media": {}
+            }
+
+    def _save_checkpoint(self):
+        """Checkpoint ni saqlash"""
+        if self.checkpoint_file:
+            try:
+                with open(self.checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(self.checkpoint_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"   ⚠️ Checkpoint saqlashda xato: {e}")
+
     async def _download_media(self, message: Message, media_type: str) -> Optional[str]:
-        """Media faylni yuklab oladi"""
+        """Media faylni yuklab oladi va S3 ga yuklaydi"""
         if not DOWNLOAD_MEDIA:
             return None
 
         try:
+            # Media unique ID ni olish
+            media_unique_id = self._get_media_unique_id(message, media_type)
+            
+            # Agar allaqachon qayta ishlangan bo'lsa, S3 URL ni qaytarish
+            if media_unique_id and self._is_media_processed(media_unique_id):
+                s3_url = self.checkpoint_data["processed_media"][media_unique_id]
+                print(f"   ⏭️ Media allaqachon yuklangan: {media_unique_id[:20]}...")
+                return s3_url
+
             # Fayl hajmini tekshirish
             file_size = None
             if media_type == "photo" and message.photo:
@@ -145,11 +233,41 @@ class TelegramExporter:
             file_path = await message.download(file_name=str(download_path) + "/")
 
             if file_path:
-                self.stats.downloaded_files += 1
-                if file_size:
-                    self.stats.download_size_bytes += file_size
-                # Faqat fayl nomini qaytarish (nisbiy yo'l)
-                return f"{folder}/{Path(file_path).name}"
+                file_path_obj = Path(file_path)
+                file_name = file_path_obj.name
+                
+                # S3 ga yuklash
+                object_name = f"{folder}/{file_name}"
+                print(f"   📤 S3 ga yuklashga tayyorlanmoqda: {file_name} ({format_file_size(file_size) if file_size else 'N/A'})")
+                success, s3_url = upload_to_b2(
+                    str(file_path),
+                    object_name=object_name,
+                    chat_folder=self.chat_folder_name
+                )
+                
+                if success and s3_url:
+                    # Media ni qayta ishlangan deb belgilash
+                    if media_unique_id:
+                        # Checkpoint da S3 URL ni saqlash (keyinroq foydalanish uchun)
+                        self._mark_media_processed(media_unique_id, s3_url)
+                    
+                    # Lokal faylni saqlab qolish (zip yuklab olish uchun)
+                    # Fayl S3 ga yuklangan, lekin lokal nusxasi ham kerak
+                    print(f"   💾 Lokal fayl saqlanib qoldi (zip uchun): {file_name}")
+                    
+                    self.stats.downloaded_files += 1
+                    if file_size:
+                        self.stats.download_size_bytes += file_size
+                    
+                    # Nisbiy yo'l qaytarish (zip yuklab olish uchun)
+                    # Format: folder/filename (masalan: photos/photo_123.jpg)
+                    relative_path = f"{folder}/{file_name}"
+                    return relative_path
+                else:
+                    print(f"   ⚠️ S3 ga yuklash muvaffaqiyatsiz: {file_name}")
+                    print(f"   💾 Lokal fayl saqlanib qoldi: {file_path}")
+                    # Agar S3 ga yuklash muvaffaqiyatsiz bo'lsa, lokal faylni saqlab qolish
+                    return f"{folder}/{file_name}"
 
         except Exception as e:
             self.stats.failed_downloads += 1
@@ -158,7 +276,7 @@ class TelegramExporter:
         return None
 
     def _serialize_message(
-        self, message: Message, local_file: str = None
+        self, message: Message, media_url: str = None
     ) -> dict[str, Any]:
         """Message ob'yektini dict ga o'tkazadi"""
         data = {
@@ -170,7 +288,8 @@ class TelegramExporter:
             "text": message.text,
             "caption": message.caption,
             "media_type": message.media.name if message.media else None,
-            "local_file": local_file,
+            "media_url": media_url,  # S3 URL yoki lokal fayl yo'li
+            "local_file": media_url,  # Qayta ishlash uchun eski nom (backward compatibility)
             "views": message.views,
             "forwards": message.forwards,
             "edit_date": message.edit_date.isoformat() if message.edit_date else None,
@@ -362,6 +481,15 @@ class TelegramExporter:
                     f"✅ Chat topildi: {self.chat_info['title'] or self.chat_info['username']}"
                 )
 
+                # Chat nomidan foydalanish
+                chat_name = self.chat_info.get("title") or self.chat_info.get("username") or str(self.chat_id)
+                # Xavfsiz fayl nomi yaratish
+                safe_name = re.sub(r'[^\w\s-]', '', chat_name).strip()
+                safe_name = re.sub(r'[-\s]+', '_', safe_name)
+                if not safe_name:
+                    safe_name = f"chat_{self.chat_id}"
+                self.chat_folder_name = safe_name
+
                 # Papkani yaratish
                 self._setup_output_dir()
 
@@ -371,12 +499,27 @@ class TelegramExporter:
 
             # Xabarlarni yuklash
             print("\n📨 Xabarlar yuklanmoqda...")
+            
+            # Checkpoint dan davom ettirish
+            last_message_id = self.checkpoint_data.get("last_message_id")
+            resume_from_checkpoint = last_message_id is not None
+            
+            if resume_from_checkpoint:
+                print(f"   🔄 Checkpoint dan davom ettirilmoqda (message ID: {last_message_id})...")
 
             async for message in self.app.get_chat_history(self.chat_id):
+                # Checkpoint dan davom ettirish
+                if resume_from_checkpoint:
+                    if message.id == last_message_id:
+                        resume_from_checkpoint = False
+                        print(f"   ✅ Checkpoint dan davom ettirildi")
+                    else:
+                        continue
+                
                 self._update_stats(message)
 
                 # Media yuklab olish
-                local_file = None
+                media_url = None
                 if message.media and DOWNLOAD_MEDIA:
                     media_type = None
                     if message.photo:
@@ -397,11 +540,16 @@ class TelegramExporter:
                         media_type = "animation"
 
                     if media_type:
-                        local_file = await self._download_media(message, media_type)
+                        media_url = await self._download_media(message, media_type)
 
                 # Xabarni qo'shish
-                msg_data = self._serialize_message(message, local_file)
+                msg_data = self._serialize_message(message, media_url)
                 self.messages.append(msg_data)
+
+                # Checkpoint ni yangilash
+                self.checkpoint_data["last_message_id"] = message.id
+                if self.stats.total_messages % 50 == 0:
+                    self._save_checkpoint()
 
                 # Progress
                 if self.stats.total_messages % 100 == 0:
@@ -415,11 +563,17 @@ class TelegramExporter:
             f"📦 {self.stats.downloaded_files} ta fayl yuklandi ({format_file_size(self.stats.download_size_bytes)})"
         )
 
+        # Yakuniy checkpoint ni saqlash
+        self._save_checkpoint()
+
         # Ma'lumotlarni saqlash
         self._save_data()
 
         # Web interfeys yaratish
         self._generate_web_viewer()
+
+        # Barcha export fayllarini S3 ga yuklash
+        self._upload_export_to_s3()
 
         print(f"\n🎉 Export muvaffaqiyatli yakunlandi!")
         print(f"📂 Papka: {self.output_dir}")
@@ -443,15 +597,120 @@ class TelegramExporter:
         print(f"💾 Ma'lumotlar saqlandi: {json_path}")
         print(f"📊 Fayl hajmi: {format_file_size(json_path.stat().st_size)}")
 
+    def _upload_export_to_s3(self):
+        """Barcha export fayllarini S3 ga yuklash"""
+        print(f"\n📤 Export fayllarini S3 ga yuklash boshlanmoqda...")
+        
+        files_to_upload = [
+            ("chat_data.json", "chat_data.json"),
+            ("index.html", "index.html"),
+            ("checkpoint.json", "checkpoint.json"),
+        ]
+        
+        uploaded_urls = {}
+        
+        for local_filename, s3_filename in files_to_upload:
+            file_path = self.output_dir / local_filename
+            if file_path.exists():
+                try:
+                    # object_name ni to'g'ri formatda yaratish
+                    object_name = f"{self.chat_folder_name}/{s3_filename}"
+                    success, s3_url = upload_to_b2(
+                        str(file_path),
+                        object_name=object_name,
+                        chat_folder=None  # object_name da allaqachon chat_folder bor
+                    )
+                    
+                    if success and s3_url:
+                        uploaded_urls[local_filename] = s3_url
+                        print(f"   ✅ {local_filename} S3 ga yuklandi")
+                    else:
+                        print(f"   ⚠️ {local_filename} S3 ga yuklashda xato")
+                except Exception as e:
+                    print(f"   ❌ {local_filename} yuklashda xato: {e}")
+            else:
+                print(f"   ⚠️ {local_filename} topilmadi")
+        
+        # S3 URL larni saqlash
+        if uploaded_urls:
+            s3_info = {
+                "s3_base_url": uploaded_urls.get("index.html", "").rsplit("/", 1)[0] if uploaded_urls.get("index.html") else "",
+                "files": uploaded_urls,
+                "upload_date": datetime.now().isoformat()
+            }
+            
+            s3_info_path = self.output_dir / "s3_info.json"
+            with open(s3_info_path, "w", encoding="utf-8") as f:
+                json.dump(s3_info, f, ensure_ascii=False, indent=2)
+            
+            # s3_info.json ni ham S3 ga yuklash
+            try:
+                s3_info_object_name = f"{self.chat_folder_name}/s3_info.json"
+                success, s3_info_url = upload_to_b2(
+                    str(s3_info_path),
+                    object_name=s3_info_object_name,
+                    chat_folder=None
+                )
+                if success:
+                    print(f"   ✅ s3_info.json S3 ga yuklandi")
+            except Exception as e:
+                print(f"   ⚠️ s3_info.json yuklashda xato: {e}")
+            
+            if uploaded_urls.get("index.html"):
+                print(f"\n🌐 S3 da Web Viewer URL:")
+                print(f"   {uploaded_urls['index.html']}")
+                print(f"\n💡 Bu URL ni istalgan joydan ochib chat tarixini ko'rishingiz mumkin!")
+                print(f"💡 Barcha media fayllar S3 da saqlanadi va HTML ichida ko'rinadi!")
+
+    def _convert_s3_url_to_relative_path(self, url: str) -> str:
+        """S3 URL ni nisbiy yo'lga o'zgartirish (zip yuklab olish uchun)"""
+        if not url:
+            return url
+        
+        # Agar URL S3 URL bo'lsa, nisbiy yo'lga o'zgartirish
+        if url.startswith('http://') or url.startswith('https://'):
+            # S3 URL format: https://bucket.s3.region.backblazeb2.com/chat_folder/folder/filename
+            # Nisbiy yo'l: folder/filename
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                path = parsed.path.lstrip('/')
+                
+                # Chat folder ni olib tashlash (birinchi qism)
+                parts = path.split('/', 1)
+                if len(parts) > 1:
+                    # folder/filename qismini olish
+                    relative_path = parts[1]
+                    return relative_path
+                else:
+                    # Agar chat_folder yo'q bo'lsa, to'g'ridan-to'g'ri qaytarish
+                    return path
+            except Exception:
+                # Xatolik bo'lsa, asl URL ni qaytarish
+                return url
+        
+        # Agar allaqachon nisbiy yo'l bo'lsa, o'zgartirmaslik
+        return url
+
     def _generate_web_viewer(self):
         """Web viewer HTML yaratish"""
         # Export ma'lumotlarini tayyorlash
+        # Media URL larni nisbiy yo'llarga o'zgartirish
+        messages_with_relative_paths = []
+        for msg in self.messages:
+            msg_copy = msg.copy()
+            if msg_copy.get('media_url'):
+                msg_copy['media_url'] = self._convert_s3_url_to_relative_path(msg_copy['media_url'])
+            if msg_copy.get('local_file'):
+                msg_copy['local_file'] = self._convert_s3_url_to_relative_path(msg_copy.get('local_file', ''))
+            messages_with_relative_paths.append(msg_copy)
+        
         export_data = {
             "export_date": datetime.now().isoformat(),
             "chat_info": self.chat_info,
             "statistics": asdict(self.stats),
             "total_messages": len(self.messages),
-            "messages": self.messages,
+            "messages": messages_with_relative_paths,
         }
 
         # JSON ni string ga o'tkazish (HTML ichiga embed qilish uchun)
@@ -1412,57 +1671,57 @@ class TelegramExporter:
         // Render media
         function renderMedia(msg) {
             const type = msg.media_type;
-            const localFile = msg.local_file;
+            const mediaUrl = msg.media_url || msg.local_file;  // S3 URL yoki lokal fayl
 
             switch (type) {
                 case 'PHOTO':
-                    if (localFile) {
-                        return `<div class="message-media"><img src="${localFile}" alt="Photo" loading="lazy"></div>`;
+                    if (mediaUrl) {
+                        return `<div class="message-media"><img src="${mediaUrl}" alt="Photo" loading="lazy"></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">🖼️</div><div>Rasm (yuklanmagan)</div></div></div>`;
 
                 case 'VIDEO':
-                    if (localFile) {
-                        return `<div class="message-media"><video controls><source src="${localFile}" type="video/mp4"></video></div>`;
+                    if (mediaUrl) {
+                        return `<div class="message-media"><video controls><source src="${mediaUrl}" type="video/mp4"></video></div>`;
                     }
                     const videoInfo = msg.video;
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">🎬</div><div>Video${videoInfo ? ` (${formatDuration(videoInfo.duration)}, ${formatSize(videoInfo.file_size)})` : ''}</div></div></div>`;
 
                 case 'AUDIO':
-                    if (localFile) {
-                        return `<div class="message-media"><audio controls src="${localFile}"></audio>
+                    if (mediaUrl) {
+                        return `<div class="message-media"><audio controls src="${mediaUrl}"></audio>
                             <div class="media-info">${msg.audio?.title || msg.audio?.file_name || 'Audio'} ${msg.audio?.performer ? '- ' + msg.audio.performer : ''}</div></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">🎵</div><div>${msg.audio?.title || 'Audio'}</div></div></div>`;
 
                 case 'DOCUMENT':
-                    if (localFile) {
-                        return `<div class="message-media"><div class="media-info">📁 <a href="${localFile}" download>${msg.document?.file_name || 'File'}</a> (${formatSize(msg.document?.file_size)})</div></div>`;
+                    if (mediaUrl) {
+                        return `<div class="message-media"><div class="media-info">📁 <a href="${mediaUrl}" download>${msg.document?.file_name || 'File'}</a> (${formatSize(msg.document?.file_size)})</div></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">📁</div><div>${msg.document?.file_name || 'File'} (${formatSize(msg.document?.file_size)})</div></div></div>`;
 
                 case 'VOICE':
-                    if (localFile) {
-                        return `<div class="message-media"><audio controls src="${localFile}"></audio>
+                    if (mediaUrl) {
+                        return `<div class="message-media"><audio controls src="${mediaUrl}"></audio>
                             <div class="media-info">🎤 Voice message (${formatDuration(msg.voice?.duration)})</div></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">🎤</div><div>Voice message (${formatDuration(msg.voice?.duration)})</div></div></div>`;
 
                 case 'VIDEO_NOTE':
-                    if (localFile) {
-                        return `<div class="message-media" style="max-width: 300px;"><video controls style="border-radius: 50%; width: 200px; height: 200px; object-fit: cover;"><source src="${localFile}" type="video/mp4"></video></div>`;
+                    if (mediaUrl) {
+                        return `<div class="message-media" style="max-width: 300px;"><video controls style="border-radius: 50%; width: 200px; height: 200px; object-fit: cover;"><source src="${mediaUrl}" type="video/mp4"></video></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">⭕</div><div>Video message</div></div></div>`;
 
                 case 'STICKER':
-                    if (localFile) {
-                        return `<div class="sticker-container"><img src="${localFile}" alt="Sticker"><div class="sticker-emoji">${msg.sticker?.emoji || ''} ${msg.sticker?.set_name || ''}</div></div>`;
+                    if (mediaUrl) {
+                        return `<div class="sticker-container"><img src="${mediaUrl}" alt="Sticker"><div class="sticker-emoji">${msg.sticker?.emoji || ''} ${msg.sticker?.set_name || ''}</div></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder">😀 ${msg.sticker?.emoji || 'Sticker'}</div></div>`;
 
                 case 'ANIMATION':
-                    if (localFile) {
-                        return `<div class="message-media"><img src="${localFile}" alt="GIF" style="max-width: 300px;"></div>`;
+                    if (mediaUrl) {
+                        return `<div class="message-media"><img src="${mediaUrl}" alt="GIF" style="max-width: 300px;"></div>`;
                     }
                     return `<div class="message-media"><div class="media-placeholder"><div class="media-placeholder-icon">🎞️</div><div>GIF</div></div></div>`;
 
